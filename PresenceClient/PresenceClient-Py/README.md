@@ -39,3 +39,19 @@ optional arguments:
   -h, --help            show this help message and exit
   --ignore-home-screen  Dont display the home screen. Defaults to false if missing this flag.
 ```
+
+# Building a release without Python on the end-user machine
+Use the repository release script from the `PresenceClient` root:
+
+```powershell
+cd .\PresenceClient-Rewritten-main\PresenceClient
+.\build-client-release.ps1
+```
+
+This will:
+- install Python build dependencies
+- build `PresenceClient-Backend.exe` with PyInstaller
+- publish the Avalonia GUI in `release\`
+- copy the backend exe next to the GUI exe
+
+The GUI will automatically prefer `PresenceClient-Backend.exe` when it exists, so end users do not need Python installed.

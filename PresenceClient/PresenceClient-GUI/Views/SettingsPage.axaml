@@ -52,6 +52,9 @@
 
                     <CheckBox Content="Automatically convert IP to MAC"
                               IsChecked="{Binding AutoConvertIpToMac}" />
+
+                    <CheckBox Content="Use Python backend for Discord presence"
+                              IsChecked="{Binding UsePythonBackend}" />
                 </StackPanel>
             </Border>
         </StackPanel>

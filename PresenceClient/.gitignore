@@ -3,6 +3,12 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/master/VisualStudio.gitignore
 
+# Repo-local generated files
+.idea/
+PresenceClient-Py/build/
+PresenceClient-Py/dist/
+PresenceClient-Py/*.spec
+
 # User-specific files
 *.rsuser
 *.suo

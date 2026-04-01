@@ -1,20 +1,19 @@
-﻿using System;
+using System;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
-using System.Net.Sockets;
 using System.Reactive;
 using System.Reactive.Linq;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Controls;
 using Avalonia.Threading;
-using DiscordRPC;
 using PresenceClient.Helpers;
 using PresenceClient.Platform;
 using PresenceClient.Views;
-using PresenceCommon.Types;
-using System.Text.Json;
-using System.Text.Json.Serialization;
+using PresenceCommon;
 using ReactiveUI;
 
 namespace PresenceClient.ViewModels
@@ -26,22 +25,19 @@ namespace PresenceClient.ViewModels
         private string bigImageKey = "";
         private string bigImageText = "";
         private CancellationTokenSource? cancellationTokenSource;
-        private Socket? client;
         private string clientId = "";
         private bool displayHomeMenu = true;
         private bool hasSeenMacPrompt;
         private string ipAddress = "";
         private bool isConnected;
-        private string lastProgramName = string.Empty;
-        private bool manualUpdate;
         private bool minimizeToTray;
+        private Process? pythonBackendProcess;
         private IPAddress? resolvedIpAddress;
-        private DiscordRpcClient? rpc;
         private bool showTimeLapsed = true;
         private string smallImageKey = "";
         private string stateText = "";
         private string status = "";
-        private Timestamps? time;
+        private bool usePythonBackend = true;
         private UserControl currentPage;
         private readonly string _configPath;
 
@@ -51,9 +47,7 @@ namespace PresenceClient.ViewModels
             currentPage = new MainPage();
 
             if (PlatformHelper.CanUseTrayIcon())
-            {
                 trayIconManager ??= new TrayIconManager(this);
-            }
 
             LoadConfig();
 
@@ -176,6 +170,16 @@ namespace PresenceClient.ViewModels
             }
         }
 
+        public bool UsePythonBackend
+        {
+            get => usePythonBackend;
+            set
+            {
+                this.RaiseAndSetIfChanged(ref usePythonBackend, value);
+                SaveConfig();
+            }
+        }
+
         public string Status
         {
             get => status;
@@ -202,13 +206,9 @@ namespace PresenceClient.ViewModels
         public void ToggleConnection()
         {
             if (IsConnected)
-            {
                 Disconnect();
-            }
             else
-            {
                 _ = ConnectAsync();
-            }
         }
 
         private async Task UpdateConnectionStatusAsync(bool isConnectedSecond)
@@ -272,6 +272,12 @@ namespace PresenceClient.ViewModels
                 return;
             }
 
+            if (!UsePythonBackend)
+            {
+                Status = "Enable the Python backend in Settings.";
+                return;
+            }
+
             try
             {
                 if (IPAddress.TryParse(ipAddress, out resolvedIpAddress))
@@ -301,8 +307,7 @@ namespace PresenceClient.ViewModels
 
                 cancellationTokenSource = new CancellationTokenSource();
                 isConnected = true;
-
-                await Task.Run(() => TryConnect(cancellationTokenSource.Token));
+                await RunPythonBackendAsync(cancellationTokenSource.Token);
             }
             catch (OperationCanceledException)
             {
@@ -321,26 +326,16 @@ namespace PresenceClient.ViewModels
             {
                 cancellationTokenSource?.Cancel();
 
-                if (rpc is { IsDisposed: false })
+                if (pythonBackendProcess != null)
                 {
-                    rpc.ClearPresence();
-                    rpc.Dispose();
+                    if (!pythonBackendProcess.HasExited)
+                        pythonBackendProcess.Kill(true);
+                    pythonBackendProcess.Dispose();
                 }
 
-                rpc = null;
-
-                if (client != null)
-                {
-                    client.Close();
-                    client.Dispose();
-                }
-
-                client = null;
-
+                pythonBackendProcess = null;
                 isConnected = false;
                 Status = "Disconnected";
-                lastProgramName = string.Empty;
-                time = null;
                 _ = UpdateConnectionStatusAsync(false);
             }
             catch (Exception ex)
@@ -349,133 +344,163 @@ namespace PresenceClient.ViewModels
             }
         }
 
-        private async Task TryConnect(CancellationToken cancellationToken)
+        private async Task RunPythonBackendAsync(CancellationToken cancellationToken)
         {
-            rpc = new DiscordRpcClient(clientId);
-            rpc.Initialize();
+            var backendCommand = await ResolvePythonBackendCommandAsync(cancellationToken);
 
-            while (!cancellationToken.IsCancellationRequested)
+            var startInfo = new ProcessStartInfo
             {
-                try
-                {
-                    client = new Socket(SocketType.Stream, ProtocolType.Tcp)
-                    {
-                        ReceiveTimeout = 5500, SendTimeout = 5500
-                    };
+                FileName = backendCommand.fileName,
+                Arguments = backendCommand.arguments,
+                WorkingDirectory = AppContext.BaseDirectory,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
 
+            pythonBackendProcess = new Process
+            {
+                StartInfo = startInfo,
+                EnableRaisingEvents = true
+            };
+
+            DebugLog.Log($"Starting Python backend: {startInfo.FileName} {startInfo.Arguments}");
+
+            if (!pythonBackendProcess.Start())
+                throw new InvalidOperationException("Python backend failed to start.");
+
+            _ = Task.Run(() => PumpPythonOutputAsync(pythonBackendProcess, cancellationToken), cancellationToken);
+            _ = Task.Run(() => PumpPythonErrorAsync(pythonBackendProcess, cancellationToken), cancellationToken);
+
+            await Dispatcher.UIThread.InvokeAsync(() => { Status = "Python backend started."; });
+            await UpdateConnectionStatusAsync(true);
+
+            try
+            {
+                await pythonBackendProcess.WaitForExitAsync(cancellationToken);
+                if (!cancellationToken.IsCancellationRequested)
+                {
                     await Dispatcher.UIThread.InvokeAsync(() =>
                     {
-                        Status = "Attempting to connect to server...";
+                        Status = $"Python backend stopped with code {pythonBackendProcess.ExitCode}. See log: {DebugLog.GetLogPath()}";
                     });
-
-                    var localEndPoint = new IPEndPoint(resolvedIpAddress!, 0xCAFE);
-
-                    await client.ConnectAsync(localEndPoint, cancellationToken);
-                    await Dispatcher.UIThread.InvokeAsync(() => Status = "Connected to the server!");
-                    await UpdateConnectionStatusAsync(true);
-
-                    await DataListenAsync(cancellationToken);
                 }
-                catch (ArgumentNullException)
+            }
+            finally
+            {
+                pythonBackendProcess.Dispose();
+                pythonBackendProcess = null;
+                await UpdateConnectionStatusAsync(false);
+            }
+        }
+
+        private async Task<(string fileName, string arguments)> ResolvePythonBackendCommandAsync(CancellationToken cancellationToken)
+        {
+            var bundledBackendPath = TryGetBundledPythonBackendPath();
+            if (bundledBackendPath != null)
+                return (bundledBackendPath, BuildPythonBackendRuntimeArguments());
+
+            var pythonCommand = await ResolvePythonCommandAsync(cancellationToken);
+            return (pythonCommand.fileName, BuildPythonScriptArguments(pythonCommand.prefixArguments));
+        }
+
+        private string? TryGetBundledPythonBackendPath()
+        {
+            var candidates = new[]
+            {
+                Path.Combine(AppContext.BaseDirectory, "PresenceClient-Backend.exe"),
+                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "release", "PresenceClient-Backend.exe"))
+            };
+
+            foreach (var candidate in candidates)
+            {
+                if (File.Exists(candidate))
+                    return candidate;
+            }
+
+            return null;
+        }
+
+        private async Task<(string fileName, string prefixArguments)> ResolvePythonCommandAsync(CancellationToken cancellationToken)
+        {
+            static async Task<bool> CanRunAsync(string fileName, string arguments, CancellationToken token)
+            {
+                using var process = new Process
                 {
-                    await Task.Delay(1000, cancellationToken);
-                    var newIp = NetworkUtils.GetIpByMac(ipAddress);
-                    if (!string.IsNullOrEmpty(newIp))
+                    StartInfo = new ProcessStartInfo
                     {
-                        resolvedIpAddress = IPAddress.Parse(newIp);
+                        FileName = fileName,
+                        Arguments = arguments,
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
                     }
-                }
-                catch (SocketException)
-                {
-                    if (client != null)
-                    {
-                        client.Close();
-                        client.Dispose();
-                        client = null;
-                    }
+                };
 
-                    if (rpc is { IsDisposed: false }) rpc.ClearPresence();
-                    await Task.Delay(5000, cancellationToken);
-                }
-                catch (Exception ex)
+                if (!process.Start())
+                    return false;
+
+                await process.WaitForExitAsync(token);
+                return process.ExitCode == 0;
+            }
+
+            if (await CanRunAsync("python", "--version", cancellationToken))
+                return ("python", string.Empty);
+
+            if (await CanRunAsync("py", "-3 --version", cancellationToken))
+                return ("py", "-3 ");
+
+            throw new InvalidOperationException("Python was not found. Install Python or add it to PATH.");
+        }
+
+        private string BuildPythonBackendRuntimeArguments()
+        {
+            var args = $"{resolvedIpAddress} {clientId} --debug";
+            if (!DisplayHomeMenu)
+                args += " --ignore-home-screen";
+            return args;
+        }
+
+        private string BuildPythonScriptArguments(string prefixArguments)
+        {
+            var scriptPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PresenceClient-Py", "presence-client.py"));
+            return $"{prefixArguments}\"{scriptPath}\" {BuildPythonBackendRuntimeArguments()}";
+        }
+
+        private async Task PumpPythonOutputAsync(Process process, CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested && !process.HasExited)
+            {
+                var line = await process.StandardOutput.ReadLineAsync(cancellationToken);
+                if (line == null)
+                    break;
+
+                DebugLog.Log($"[py] {line}");
+                if (line.Contains("STATUS: ", StringComparison.Ordinal))
                 {
-                    await Dispatcher.UIThread.InvokeAsync(() => Status = $"Connection error: {ex.Message}");
-                    await Task.Delay(5000, cancellationToken);
+                    var statusText = line[(line.IndexOf("STATUS: ", StringComparison.Ordinal) + "STATUS: ".Length)..];
+                    await Dispatcher.UIThread.InvokeAsync(() => Status = statusText);
+                }
+                else if (line.Contains("GAME: ", StringComparison.Ordinal))
+                {
+                    var gameText = line[(line.IndexOf("GAME: ", StringComparison.Ordinal) + "GAME: ".Length)..];
+                    await Dispatcher.UIThread.InvokeAsync(() => Status = $"Game: {gameText}");
                 }
             }
         }
 
-        private async Task DataListenAsync(CancellationToken cancellationToken)
+        private async Task PumpPythonErrorAsync(Process process, CancellationToken cancellationToken)
         {
-            manualUpdate = true;
-            while (!cancellationToken.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested && !process.HasExited)
             {
-                try
-                {
-                    var bytes = await PresenceCommon.Utils.ReceiveExactlyAsync(client!,
-                        cancellationToken: cancellationToken);
-                    await Dispatcher.UIThread.InvokeAsync(() => Status = "Connected to the server!");
+                var line = await process.StandardError.ReadLineAsync(cancellationToken);
+                if (line == null)
+                    break;
 
-                    var title = new Title(bytes);
-                    if (title.Magic == 0xffaadd23)
-                    {
-                        if (lastProgramName != title.Name)
-                        {
-                            time = Timestamps.Now;
-                        }
-
-                        if (lastProgramName != title.Name || manualUpdate)
-                        {
-                            await UpdatePropertiesFromTitle(title);
-
-                            if (rpc is { IsDisposed: false })
-                            {
-                                if (!DisplayHomeMenu && title.Name == "Home Menu")
-                                    rpc.ClearPresence();
-                                else
-                                {
-                                    rpc.SetPresence(PresenceCommon.Utils.CreateDiscordPresence(title, time, BigImageKey,
-                                        BigImageText, SmallImageKey, StateText, ShowTimeLapsed));
-                                }
-                            }
-
-                            manualUpdate = false;
-                            lastProgramName = title.Name;
-                        }
-                    }
-                    else
-                    {
-                        if (rpc is { IsDisposed: false }) rpc.ClearPresence();
-                        if (client == null) return;
-                        client.Close();
-                        client.Dispose();
-                        return;
-                    }
-                }
-                catch (SocketException)
-                {
-                    if (rpc is { IsDisposed: false }) rpc.ClearPresence();
-                    if (client == null) return;
-                    client.Close();
-                    client.Dispose();
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    await Dispatcher.UIThread.InvokeAsync(() => Status = $"Error during data listen: {ex.Message}");
-                    return;
-                }
+                DebugLog.Log($"[py-err] {line}");
             }
-        }
-
-        private async Task UpdatePropertiesFromTitle(Title title)
-        {
-            await Dispatcher.UIThread.InvokeAsync(() =>
-            {
-                BigImageKey = $"0{title.ProgramId:x}";
-                BigImageText = title.Name;
-                StateText = $"Playing {title.Name}";
-            });
         }
 
         private async Task IpToMacAsync()
@@ -514,6 +539,7 @@ namespace PresenceClient.ViewModels
                 displayHomeMenu = cfg.DisplayMainMenu;
                 hasSeenMacPrompt = cfg.SeenAutoMacPrompt;
                 autoConvertIpToMac = cfg.AutoToMac;
+                usePythonBackend = cfg.UsePythonBackend;
                 trayIconManager?.EnableTrayIcon(cfg.AllowTray);
             }
             catch (Exception ex)
@@ -522,7 +548,6 @@ namespace PresenceClient.ViewModels
                 minimizeToTray = false;
             }
         }
-
 
         private void SaveConfig()
         {
@@ -542,7 +567,8 @@ namespace PresenceClient.ViewModels
                     AllowTray = minimizeToTray,
                     DisplayMainMenu = displayHomeMenu,
                     SeenAutoMacPrompt = hasSeenMacPrompt,
-                    AutoToMac = autoConvertIpToMac
+                    AutoToMac = autoConvertIpToMac,
+                    UsePythonBackend = usePythonBackend
                 };
 
                 var jsonString = JsonSerializer.Serialize(cfg, SourceGenerationContext.Default.Config);
@@ -574,11 +600,13 @@ namespace PresenceClient.ViewModels
         public bool DisplayMainMenu { get; set; }
         public bool SeenAutoMacPrompt { get; set; }
         public bool AutoToMac { get; set; }
+        public bool UsePythonBackend { get; set; }
 
         public Config()
         {
             DisplayMainMenu = true;
             DisplayTimer = true;
+            UsePythonBackend = true;
         }
     }
 }
